@@ -151,11 +151,32 @@ class AtomisticRepresentation(nn.Module):
         # aggregation layer intermediate interactions
         self.interaction_aggregation = interaction_aggregation
 
+        # vram dict
+        self.vram = dict(
+            initial=None,
+            embedding=None,
+            distance_provider=None,
+            distance_expansion=None,
+            post_modules=None,
+            interaction_aggregation=None,
+        )
+        self.vram.update({
+            k + str(i): None for k in [
+                "pre_interaction_",
+                "interaction_",
+                "post_interaction_",
+                "interaction_refinement_",
+                "interaction_output_",
+            ] for i in range(self.n_interactions)
+        })
+
     @property
     def n_atom_basis(self):
         return self.interactions[0].n_atom_basis
 
     def forward(self, inputs):
+        self.vram["initial"] = get_vram()
+
         # get tensors from input dictionary
         atomic_numbers = inputs[Properties.Z]
         positions = inputs[Properties.R]
@@ -176,31 +197,36 @@ class AtomisticRepresentation(nn.Module):
 
         # get atom embeddings for the input atomic numbers
         x = self.embedding(atomic_numbers)
+        self.vram["embedding"] = get_vram()
 
         # compute interatomic distance of every atom to its neighbors
         r_ij = self.distance_provider(
             positions, neighbors, cell, cell_offset, neighbor_mask=neighbor_mask
         )
+        self.vram["distance_provider"] = get_vram()
+
         # expand interatomic distances (for example, Gaussian smearing)
         f_ij = self.distance_expansion(r_ij)
+        self.vram["distance_expansion"] = get_vram()
 
         # compute intermediate interactions
         intermediate_interactions = []
-        for (
+        for i, (
             pre_interaction,
             interaction,
             post_interaction,
             interaction_refinement,
             interaction_output,
-        ) in zip(
+        ) in enumerate(zip(
             self.pre_interactions,
             self.interactions,
             self.post_interactions,
             self.interaction_refinements,
             self.interaction_outputs,
-        ):
+        )):
             # pre interaction
             x = pre_interaction(x)
+            self.vram["pre_interaction_{}".format(i)] = get_vram()
 
             # interaction layer x+v
             v = interaction(
@@ -213,6 +239,7 @@ class AtomisticRepresentation(nn.Module):
                 spins=spins,
                 atom_mask=atom_mask,
             )
+            self.vram["interaction_{}".format(i)] = get_vram()
 
             # residual sum
             x = x + v
@@ -220,19 +247,26 @@ class AtomisticRepresentation(nn.Module):
             # interaction refinement
             refinement_features = interaction_refinement({**inputs, "x": x})
             x = x + refinement_features
+            self.vram["interaction_refinement_{}".format(i)] = get_vram()
 
             # post interaction layer
             x = post_interaction(x)
+            self.vram["post_interaction_{}".format(i)] = get_vram()
 
             # output layer for interaction blocks
             y = interaction_output(x)
+            self.vram["interaction_output_{}".format(i)] = get_vram()
 
             # collect intermediate results
             intermediate_interactions.append(y)
 
         # get representation by aggregating intermediate interactions or selecting
         # last interaction output
+        self.vram["post_modules"] = get_vram()
+
         representation = self.interaction_aggregation(intermediate_interactions, x)
+
+        self.vram["interaction_aggregation"] = get_vram()
 
         # build results dict
         results = dict(representation=representation)
@@ -242,3 +276,9 @@ class AtomisticRepresentation(nn.Module):
             results.update(dict(distances=r_ij))
 
         return results
+
+def get_vram():
+    if torch.cuda.is_available():
+        return torch.cuda.getMemoryUsage(0)
+    else:
+        return "no gpu"
