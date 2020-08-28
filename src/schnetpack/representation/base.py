@@ -279,6 +279,6 @@ class AtomisticRepresentation(nn.Module):
 
 def get_vram():
     if torch.cuda.is_available():
-        return torch.cuda.getMemoryUsage(0)
+        return torch.cuda.memory_allocated(0)
     else:
         return "no gpu"
