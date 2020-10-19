@@ -20,4 +20,5 @@ from schnetpack.representation.hdnn import (
     BehlerSFBlock,
     StandardizeSF,
     SymmetryFunctions,
+    APNet,
 )

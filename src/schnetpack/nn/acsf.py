@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-
+import sys
 from schnetpack.nn.cutoff import CosineCutoff
 
 __all__ = [
@@ -8,6 +8,7 @@ __all__ = [
     "BehlerAngular",
     "GaussianSmearing",
     "RadialDistribution",
+    "APDistribution",
 ]
 
 
@@ -71,7 +72,7 @@ class AngularDistribution(nn.Module):
         cos_theta = (torch.pow(r_ij, 2) + torch.pow(r_ik, 2) - torch.pow(r_jk, 2)) / (
             2.0 * r_ij * r_ik
         )
-
+        
         # Required in order to catch NaNs during backprop
         if triple_masks is not None:
             cos_theta[triple_masks == 0] = 0.0
@@ -131,6 +132,47 @@ class AngularDistribution(nn.Module):
 
         return angular_distribution
 
+class APDistribution(nn.Module):
+    def __init__(
+        self,
+        radial_filter,
+        cutoff_functions=CosineCutoff,
+    ):
+        super(APDistribution, self).__init__()
+        self.radial_filter = radial_filter
+        self.cutoff_function = cutoff_functions
+
+    def forward(self, r_ij, r_ik, r_jk, triple_masks=None, elemental_weights=None):
+        nbatch, natoms, npairs = r_ij.size()
+        nangle = int(npairs**(0.5))
+
+        # Use cosine rule to compute cos( theta_ijk )
+        cos_theta = (torch.pow(r_ij, 2) + torch.pow(r_ik, 2) - torch.pow(r_jk, 2)) / (
+            2.0 * r_ij * r_ik
+        )
+        
+        # Required in order to catch NaNs during backprop
+        if triple_masks is not None:
+            cos_theta[triple_masks == 0] = 0.0
+        
+        radial_distribution = self.radial_filter(cos_theta)
+        
+        # If requested, apply cutoff function
+        if self.cutoff_function is not None:
+            cutoffs = self.cutoff_function(r_ik)
+            radial_distribution = radial_distribution * cutoffs.unsqueeze(-1)
+
+        # Weigh elements if requested
+        if elemental_weights is not None:
+            radial_distribution = (
+                radial_distribution[:, :, :, :, None]
+                * elemental_weights[:, :, :, None, :].float()
+            )
+
+        radial_distribution = torch.reshape(radial_distribution, (radial_distribution.shape[0], radial_distribution.shape[1], nangle, nangle, radial_distribution.shape[3], radial_distribution.shape[4]))
+        radial_distribution = torch.sum(radial_distribution, 3)
+        radial_distribution = radial_distribution.view(nbatch, natoms, nangle, -1)
+        return radial_distribution
 
 class BehlerAngular(nn.Module):
     """
@@ -213,12 +255,12 @@ class GaussianSmearing(nn.Module):
     """
 
     def __init__(
-        self, start=0.0, stop=5.0, n_gaussians=50, centered=False, trainable=False
+        self, start=0.0, stop=5.0, n_gaussians=50, centered=False, trainable=False, width_adjust=1
     ):
         super(GaussianSmearing, self).__init__()
         # compute offset and width of Gaussian functions
         offset = torch.linspace(start, stop, n_gaussians)
-        widths = torch.FloatTensor((offset[1] - offset[0]) * torch.ones_like(offset))
+        widths = torch.FloatTensor((offset[1] - offset[0]) * torch.ones_like(offset) * width_adjust)
         if trainable:
             self.width = nn.Parameter(widths)
             self.offsets = nn.Parameter(offset)

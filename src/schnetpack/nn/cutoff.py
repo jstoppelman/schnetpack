@@ -54,7 +54,6 @@ class CosineCutoff(nn.Module):
         cutoffs *= (distances < self.cutoff).float()
         return cutoffs
 
-
 class MollifierCutoff(nn.Module):
     r"""Class for mollifier cutoff scaled to have a value of 1 at :math:`r=0`.
 

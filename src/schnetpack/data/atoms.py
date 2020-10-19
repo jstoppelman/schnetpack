@@ -14,18 +14,16 @@ References
 import logging
 import os
 import warnings
+from base64 import b64encode, b64decode
 
 import numpy as np
 import torch
 from ase.db import connect
 from torch.utils.data import Dataset
 
-import schnetpack as spk
 from schnetpack import Properties
-from schnetpack.environment import SimpleEnvironmentProvider, collect_atom_triples
-
+from schnetpack.environment import SimpleEnvironmentProvider, collect_atom_triples, InterEnvironmentProvider
 from .partitioning import train_test_split
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +73,11 @@ class AtomsData(Dataset):
     ASE database. Use together with schnetpack.data.AtomsLoader to feed data
     to your model.
 
+    To improve the performance, the data is not stored in string format,
+    as usual in the ASE database. Instead, it is encoded as binary before being written
+    to the database. Reading work both with binary-encoded as well as
+    standard ASE files.
+
     Args:
         dbpath (str): path to directory containing database.
         subset (list, optional): indices to subset. Set to None for entire database.
@@ -111,11 +114,6 @@ class AtomsData(Dataset):
             )
 
         self.dbpath = dbpath
-
-        # check if database is deprecated:
-        if self._is_deprecated():
-            self._deprecation_update()
-
         self.subset = subset
         self.load_only = load_only
         self.available_properties = self.get_available_properties(available_properties)
@@ -139,7 +137,7 @@ class AtomsData(Dataset):
             (list): all properties of the dataset
         """
         # use the provided list
-        if not os.path.exists(self.dbpath) or len(self) == 0:
+        if not os.path.exists(self.dbpath):
             if available_properties is None:
                 raise AtomsDataError(
                     "Please define available_properties or set "
@@ -150,6 +148,7 @@ class AtomsData(Dataset):
         with connect(self.dbpath) as conn:
             atmsrw = conn.get(1)
             db_properties = list(atmsrw.data.keys())
+            db_properties = [prop for prop in db_properties if not prop.startswith("_")]
         # check if properties match
         if available_properties is None or set(db_properties) == set(
             available_properties
@@ -271,13 +270,26 @@ class AtomsData(Dataset):
 
     def _add_system(self, conn, atoms, **properties):
         data = {}
-
-        # add available properties to database
+        
         for pname in self.available_properties:
             try:
-                data[pname] = properties[pname]
+                prop = properties[pname]
             except:
                 raise AtomsDataError("Required property missing:" + pname)
+
+            try:
+                pshape = prop.shape
+                ptype = prop.dtype
+            except:
+                raise AtomsDataError(
+                    "Required property `" + pname + "` has to be `numpy.ndarray`."
+                )
+
+            base64_bytes = b64encode(prop.tobytes())
+            base64_string = base64_bytes.decode(AtomsData.ENCODING)
+            data[pname] = base64_string
+            data["_shape_" + pname] = pshape
+            data["_dtype_" + pname] = str(ptype)
 
         conn.write(atoms, data=data)
 
@@ -327,7 +339,26 @@ class AtomsData(Dataset):
         # extract properties
         properties = {}
         for pname in self.load_only:
-            properties[pname] = torch.FloatTensor(row.data[pname].copy())
+            # new data format
+            try:
+                shape = row.data["_shape_" + pname]
+                dtype = row.data["_dtype_" + pname]
+                prop = np.frombuffer(b64decode(row.data[pname]), dtype=dtype)
+                prop = prop.reshape(shape)
+            except:
+                # fallback for properties stored directly
+                # in the row
+                if pname in row:
+                    prop = row[pname]
+                else:
+                    prop = row.data[pname]
+
+                try:
+                    prop.shape
+                except AttributeError as e:
+                    prop = np.array([prop], dtype=np.float32)
+
+            properties[pname] = torch.FloatTensor(prop)
 
         # extract/calculate structure
         properties = _convert_atoms(
@@ -380,63 +411,14 @@ class AtomsData(Dataset):
             properties = [properties]
         return {p: self._get_atomref(p) for p in properties}
 
-    def _is_deprecated(self):
-        """
-        Check if database is deprecated.
-
-        Returns:
-            (bool): True if ase db is deprecated.
-        """
-        # check if db exists
-        if not os.path.exists(self.dbpath):
-            return False
-
-        # get properties of first atom
-        with connect(self.dbpath) as conn:
-            data = conn.get(1).data
-
-        # check byte style deprecation
-        if True in [pname.startswith("_dtype_") for pname in data.keys()]:
-            return True
-        # fallback for properties stored directly in the row
-        if True in [type(val) != np.ndarray for val in data.values()]:
-            return True
-
-        return False
-
-    def _deprecation_update(self):
-        """
-        Update deprecated database to a valid ase database.
-        """
-        warnings.warn(
-            "The database is deprecated and will be updated automatically. "
-            "The old database is moved to {}.deprecated!".format(self.dbpath)
-        )
-
-        # read old database
-        atoms_list, properties_list = spk.utils.read_deprecated_database(self.dbpath)
-        metadata = self.get_metadata()
-
-        # move old database
-        os.rename(self.dbpath, self.dbpath + ".deprecated")
-
-        # write updated database
-        self.set_metadata(metadata=metadata)
-        with connect(self.dbpath) as conn:
-            for atoms, properties in tqdm(
-                zip(atoms_list, properties_list),
-                "Updating new database",
-                total=len(atoms_list),
-            ):
-                conn.write(atoms, data=properties)
-
 
 def _convert_atoms(
     atoms,
     environment_provider=SimpleEnvironmentProvider(),
     collect_triples=False,
-    centering_function=None,
+    centering_function=get_center_of_mass,
     output=None,
+    res_list=None,
 ):
     """
         Helper function to convert ASE atoms object to SchNetPack input format.
@@ -469,21 +451,63 @@ def _convert_atoms(
     inputs[Properties.R] = torch.FloatTensor(positions)
     inputs[Properties.cell] = torch.FloatTensor(cell)
 
-    # get atom environment
-    nbh_idx, offsets = environment_provider.get_environment(atoms)
+    if type(environment_provider).__name__ != "APNetEnvironmentProvider":
 
-    # Get neighbors and neighbor mask
-    inputs[Properties.neighbors] = torch.LongTensor(nbh_idx.astype(np.int))
+        # get atom environment
+        nbh_idx, offsets = environment_provider.get_environment(atoms)
 
-    # Get cells
-    inputs[Properties.cell] = torch.FloatTensor(cell)
-    inputs[Properties.cell_offset] = torch.FloatTensor(offsets.astype(np.float32))
+        # Get neighbors and neighbor mask
+        inputs[Properties.neighbors] = torch.LongTensor(nbh_idx.astype(np.int))
 
-    # If requested get neighbor lists for triples
-    if collect_triples:
-        nbh_idx_j, nbh_idx_k, offset_idx_j, offset_idx_k = collect_atom_triples(nbh_idx)
+        # Get cells
+        inputs[Properties.cell_offset] = torch.FloatTensor(offsets.astype(np.float32))
+
+        # If requested get neighbor lists for triples
+        if collect_triples:
+            nbh_idx_j, nbh_idx_k, offset_idx_j, offset_idx_k = collect_atom_triples(nbh_idx)
+            inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
+            inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
+
+            inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
+                offset_idx_j.astype(np.int)
+            )
+            inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
+                offset_idx_k.astype(np.int)
+            )
+    
+    else:
+        if res_list is not None:
+            monA = len(res_list[0])
+            monB = len(res_list[1])
+            inputs['ZA'] = torch.LongTensor(atoms.numbers[0:monA].astype(np.int))
+            inputs['ZB'] = torch.LongTensor(atoms.numbers[monA:monA+monB].astype(np.int))
+      
+        inputs['ZA'], inputs['ZB'] = inputs['ZA'].long(), inputs['ZB'].long()
+
+        # get atom environment
+        nbh_idx_intra, offset_intra, nbh_idx_inter, offsets_inter = environment_provider.get_environment(atoms, inputs)
+
+        # Get neighbors and neighbor mask
+        inputs[Properties.neighbor_inter] = torch.LongTensor(nbh_idx_inter.astype(np.int))
+        
+        mask = inputs[Properties.neighbor_inter] >= 0
+        inputs[Properties.neighbor_inter_mask] = mask.float()
+        inputs[Properties.neighbor_inter] = (
+            inputs[Properties.neighbor_inter] * inputs[Properties.neighbor_inter_mask].long()
+        )
+
+        # Get cells
+        inputs[Properties.neighbor_offset_inter] = torch.FloatTensor(offsets_inter.astype(np.float32))
+
+        natoms, nneigh = nbh_idx_inter.shape
+        nbh_idx_k = np.tile(nbh_idx_intra, nneigh)
+        nbh_idx_j = np.repeat(nbh_idx_inter, nneigh).reshape((natoms, -1))
+
+        offset_idx = np.tile(np.arange(nneigh), (natoms, 1))
+        offset_idx_k = np.tile(offset_idx, nneigh)
+        offset_idx_j = np.repeat(offset_idx, nneigh).reshape((natoms, -1))
         inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
-        inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
+        inputs[Properties.neighbor_pairs_k] = torch.LongTensor(offset_idx_k.astype(np.int))
 
         inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
             offset_idx_j.astype(np.int)
@@ -492,8 +516,22 @@ def _convert_atoms(
             offset_idx_k.astype(np.int)
         )
 
-    return inputs
+        mask_triples = np.ones_like(inputs[Properties.neighbor_pairs_j].numpy())
+        mask_triples[inputs[Properties.neighbor_pairs_j].numpy() < 0] = 0
+        mask_triples[inputs[Properties.neighbor_pairs_k].numpy() < 0] = 0
+        mask_self = np.array([np.where(nbh_idx_k[i] == i)[0] for i in range(nbh_idx_intra.shape[0])])
+        rows = np.repeat(np.arange(0, mask_self.shape[0], 1), mask_self.shape[1])
+        columns = mask_self.flatten()
+        mask_triples[rows, columns] = 0
+        inputs[Properties.neighbor_pairs_mask] = torch.LongTensor(mask_triples.astype(np.float))
 
+        mask_self = np.array([np.where(nbh_idx_intra[i] != i)[0] for i in range(nbh_idx_intra.shape[0])])
+        neighborhood_idx = np.array([nbh_idx_intra[i, mask_self[i]] for i in range(nbh_idx_intra.shape[0])])
+        inputs[Properties.neighbors] = torch.LongTensor(neighborhood_idx.astype(np.int))
+
+        inputs[Properties.cell_offset] = torch.FloatTensor(offset_intra.astype(np.float32))
+
+    return inputs
 
 class AtomsConverter:
     """
@@ -511,10 +549,11 @@ class AtomsConverter:
         environment_provider=SimpleEnvironmentProvider(),
         collect_triples=False,
         device=torch.device("cpu"),
+        res_list=None,
     ):
         self.environment_provider = environment_provider
         self.collect_triples = collect_triples
-
+        self.res_list = res_list
         # Get device
         self.device = device
 
@@ -527,8 +566,8 @@ class AtomsConverter:
             dict of torch.Tensor: Properties including neighbor lists and masks
                 reformated into SchNetPack input format.
         """
-        inputs = _convert_atoms(atoms, self.environment_provider, self.collect_triples)
-
+        inputs = _convert_atoms(atoms, self.environment_provider, self.collect_triples, res_list=self.res_list)
+        
         # Calculate masks
         inputs[Properties.atom_mask] = torch.ones_like(inputs[Properties.Z]).float()
         mask = inputs[Properties.neighbors] >= 0

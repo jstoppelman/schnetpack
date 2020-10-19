@@ -9,6 +9,7 @@ from schnetpack import nn as L, Properties
 __all__ = [
     "Atomwise",
     "ElementalAtomwise",
+    "Pairwise",
     "DipoleMoment",
     "ElementalDipoleMoment",
     "Polarizability",
@@ -173,9 +174,7 @@ class Atomwise(nn.Module):
             )[0]
             # Compute cell volume
             volume = torch.sum(
-                cell[:, 0, :] * torch.cross(cell[:, 1, :], cell[:, 2, :], dim=1),
-                dim=1,
-                keepdim=True,
+                cell[:, 0] * torch.cross(cell[:, 1], cell[:, 2]), dim=1, keepdim=True
             )[..., None]
             # Finalize stress tensor
             result[self.stress] = stress / volume
@@ -344,6 +343,93 @@ class ElementalAtomwise(Atomwise):
             outnet=outnet,
         )
 
+class Pairwise(nn.Module):
+    def __init__(
+        self,
+        n_in,
+        n_out=1,
+        aggregation_mode="sum",
+        n_layers=4,
+        n_hidden=128,
+        n_acsf=43,
+        n_apf=21, 
+        n_acsf_nodes=100,
+        n_apf_nodes=50,
+        n_neurons=None,
+        elements=frozenset((1, 6, 7, 8, 9)),
+        activation=schnetpack.nn.activations.shifted_softplus,
+        property="y",
+        contributions=None,
+        derivative=None,
+        negative_dr=False,
+        stress=None,
+        create_graph=True,
+        mean=None,
+        stddev=None,
+    ):
+        super(Pairwise, self).__init__()
+
+        self.n_layers = n_layers
+        self.create_graph = create_graph
+        self.property = property
+        self.contributions = contributions
+        self.derivative = derivative
+        self.negative_dr = negative_dr
+        self.stress = stress
+
+        self.out_net = schnetpack.nn.blocks.PairGatedNetwork(
+            n_in,
+            n_out,
+            elements,
+            n_acsf,
+            n_apf,
+            n_acsf_nodes=n_acsf_nodes,
+            n_apf_nodes=n_apf_nodes,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+        mean = torch.FloatTensor([0.0]) if mean is None else mean
+        stddev = torch.FloatTensor([1.0]) if stddev is None else stddev
+
+        # build standardization layer
+        self.standardize = schnetpack.nn.base.ScaleShift(mean, stddev)
+
+        # build aggregation layer
+        if aggregation_mode == "sum":
+            self.pair_pool = schnetpack.nn.base.Aggregate(axis=1, mean=False)
+        elif aggregation_mode == "avg":
+            self.pair_pool = schnetpack.nn.base.Aggregate(axis=1, mean=True)
+        else:
+            raise AtomwiseError(
+                "{} is not a valid aggregation " "mode!".format(aggregation_mode)
+            )
+
+    def forward(self, inputs):
+        atomic_numbers = inputs[Properties.Z]
+        atom_mask = inputs[Properties.atom_mask]
+
+        yi = self.out_net(inputs)
+        yi = self.standardize(yi)
+
+        y = self.pair_pool(yi)
+
+        # collect results
+        result = {self.property: y}
+
+        if self.derivative is not None:
+            sign = -1.0 if self.negative_dr else 1.0
+            dy = grad(
+                result[self.property],
+                inputs[Properties.R],
+                grad_outputs=torch.ones_like(result[self.property]),
+                create_graph=self.create_graph,
+                retain_graph=True,
+            )[0]
+            result[self.derivative] = sign * dy
+        
+        return result
 
 class ElementalDipoleMoment(DipoleMoment):
     """

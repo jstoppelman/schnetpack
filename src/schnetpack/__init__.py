@@ -19,6 +19,9 @@ class Properties:
     neighbor_pairs_mask = "_neighbor_pairs_mask"
     neighbor_offsets_j = "_neighbor_offsets_j"
     neighbor_offsets_k = "_neighbor_offsets_k"
+    neighbor_inter = "_neighbor_inter"
+    neighbor_offset_inter = "_neighbor_offset_inter"
+    neighbor_inter_mask = "_neighbor_inter_mask"
 
     # chemical properties
     energy = "energy"
@@ -77,7 +80,7 @@ class Properties:
     }
 
 
-from schnetpack.atomistic import AtomisticModel
+from schnetpack.atomistic import AtomisticModel, PairwiseModel
 from schnetpack.data import *
 
 from schnetpack import atomistic

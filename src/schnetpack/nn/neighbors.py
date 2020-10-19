@@ -62,7 +62,7 @@ def atom_distances(
 
     # Compute vector lengths
     distances = torch.norm(dist_vec, 2, 3)
-
+    
     if neighbor_mask is not None:
         # Avoid problems with zero distances in forces (instability of square
         # root derivative at 0) This way is neccessary, as gradients do not
@@ -163,7 +163,7 @@ def triple_distances(
 
     pos_j = positions[idx_m, neighbors_j[:], :]
     pos_k = positions[idx_m, neighbors_k[:], :]
-
+    
     if cell is not None:
         # Get the offsets into true cartesian values
         B, A, N, D = cell_offsets.size()

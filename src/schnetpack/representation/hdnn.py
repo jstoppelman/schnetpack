@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
-
+import sys
 import schnetpack.nn as snn
 from schnetpack.data import StatisticsAccumulator
 from schnetpack import Properties
-
+import numpy as np
 
 class HDNNException(Exception):
     pass
@@ -226,6 +226,7 @@ class SymmetryFunctions(nn.Module):
             radial_sf = self.RDF(
                 distances, elemental_weights=Z_ij, neighbor_mask=neighbor_mask
             )
+
         else:
             radial_sf = None
 
@@ -250,7 +251,7 @@ class SymmetryFunctions(nn.Module):
             # Offset indices
             offset_idx_j = inputs[Properties.neighbor_offsets_j]
             offset_idx_k = inputs[Properties.neighbor_offsets_k]
-
+            
             # Compute triple distances
             r_ij, r_ik, r_jk = snn.triple_distances(
                 positions,
@@ -337,6 +338,260 @@ class BehlerSFBlock(SymmetryFunctions):
             pairwise_elements=pairwise_elements,
         )
 
+class APNet(nn.Module):
+    def __init__(
+        self,
+        n_radial=43,
+        n_ap=21,
+        cutoff_radius=8.0,
+        sym_start=0.8,
+        sym_cut=5.5,
+        width_adjust=(0.5)**(0.5),
+        width_adjust_ap=(2)**(0.5),
+        elements=frozenset((1, 6, 7, 8, 9)),
+        centered=False,
+        sharez=True,
+        trainz=False,
+        mode="Behler",
+        cutoff=snn.CosineCutoff,
+        len_embedding=1,
+    ):
+        super(APNet, self).__init__() 
+
+         # Determine mode.
+        if mode == "weighted":
+            initz = "weighted"
+            pairwise_elements = False
+        elif mode == "Behler":
+            initz = "onehot"
+            pairwise_elements = True
+        else:
+            raise NotImplementedError("Unrecognized symmetry function %s" % mode)
+
+        self.n_radial = n_radial
+        self.n_ap = n_ap
+        self.len_embedding = len_embedding
+        self.n_elements = None
+
+        self.cutoff_radius = cutoff_radius
+        self.cutoff = cutoff(cutoff=self.cutoff_radius)
+        self.sym_cut = sym_cut
+
+        # Check for general stupidity:
+        if self.n_ap < 1 and self.n_radial < 1:
+            raise ValueError("At least one type of SF required")
+
+        if self.n_radial > 0:
+            # Get basic filters (if centered Gaussians are requested, start is set to 0.5
+            if centered:
+                radial_start = 1.0
+            else:
+                radial_start = 0.5
+            self.radial_filter = snn.GaussianSmearing(
+                start=sym_start,
+                stop=self.sym_cut - 0.5,
+                n_gaussians=n_radial,
+                centered=centered,
+                width_adjust=width_adjust
+            )
+            self.RDF = snn.RadialDistribution(
+                self.radial_filter, cutoff_function=self.cutoff
+            )
+        else:
+            self.RDF = None
+
+        if self.n_ap > 0:
+            self.radial_filter_ap = snn.GaussianSmearing(
+                start=-1.0,
+                stop=1.0,
+                n_gaussians=n_ap,
+                centered=centered,
+                width_adjust=width_adjust_ap
+            )
+            self.APF = snn.APDistribution(
+                self.radial_filter_ap, cutoff_functions=self.cutoff
+            )
+        
+        else:
+            self.APF = None
+
+        self.radial_Z = self.initz(initz, elements)
+
+        # check whether angular functions should use the same embedding
+        if sharez:
+            self.ap_Z = self.radial_Z
+        else:
+            self.ap_Z = self.initz(initz, elements)
+
+        # Turn of training of embeddings unless requested explicitly
+        if not trainz:
+            # Turn off gradients
+            self.radial_Z.weight.requires_grad = False
+            self.ap_Z.weight.requires_grad = False
+    
+        # Compute total number of symmetry functions
+        self.n_symfuncs = (
+                self.n_radial + self.n_ap 
+            ) * self.n_elements
+
+    def initz(self, mode, elements):
+        maxelements = max(elements)
+        nelements = len(elements)
+
+        if mode == "weighted":
+            weights = torch.arange(maxelements + 1)[:, None]
+            z_weights = nn.Embedding(maxelements + 1, 1)
+            z_weights.weight.data = weights
+            self.n_elements = 1
+        elif mode == "onehot":
+            weights = torch.zeros(maxelements + 1, nelements)
+            for idx, Z in enumerate(elements):
+                weights[Z, idx] = 1.0
+            z_weights = nn.Embedding(maxelements + 1, nelements)
+            z_weights.weight.data = weights
+            self.n_elements = nelements
+        elif mode == "embedding":
+            z_weights = nn.Embedding(maxelements + 1, self.len_embedding)
+            self.n_elements = self.len_embedding
+        else:
+            raise NotImplementedError(
+                "Unregognized option {:s} for initializing elemental weights. Use 'weighted', 'onehot' or 'embedding'.".format(
+                    mode
+                )
+            )
+
+        return z_weights
+
+    def forward(self, inputs):
+        """
+        Args:
+            inputs (dict of torch.Tensor): SchNetPack format dictionary of input tensors.
+
+        Returns:
+            torch.Tensor: Nbatch x Natoms x Nsymmetry_functions Tensor containing ACSFs or wACSFs.
+
+        """
+        positions = inputs[Properties.R]
+        Z = inputs[Properties.Z]
+        neighbors = inputs[Properties.neighbors]
+        neighbor_mask = inputs[Properties.neighbor_mask]
+
+        cell = inputs[Properties.cell]
+        cell_offset = inputs[Properties.cell_offset]
+        # Compute radial functions
+        if self.RDF is not None:
+            ZA = inputs['ZA']
+            ZB = inputs['ZB']
+
+            # Get atom type embeddings
+            Z_rad = self.radial_Z(Z)
+            # Get atom types of neighbors
+            Z_ij = snn.neighbor_elements(Z_rad, neighbors)
+            # Compute distances
+            distances = snn.atom_distances(
+                positions,
+                neighbors,
+                neighbor_mask=neighbor_mask,
+                cell=cell,
+                cell_offsets=cell_offset,
+            )
+            radial_sf = self.RDF(
+                distances, elemental_weights=Z_ij, neighbor_mask=neighbor_mask
+            )
+       
+            mon_A = np.arange(0, ZA.shape[1], 1)
+            mon_B = np.arange(ZA.shape[1], ZA.shape[1]+ZB.shape[1], 1)
+
+            radial_sf_A = radial_sf[:, mon_A, :]
+            radial_sf_B = radial_sf[:, mon_B, :]
+
+        else:
+            radial_sf = None
+
+        if self.APF is not None:
+            try:
+                idx_j = inputs[Properties.neighbor_pairs_j]
+                idx_k = inputs[Properties.neighbor_pairs_k]
+
+            except KeyError as e:
+                raise HDNNException(
+                    "Angular symmetry functions require "
+                    + "`collect_triples=True` in AtomsData."
+                )
+
+            ZA = inputs['ZA']
+            ZB = inputs['ZB']
+
+            neighbor_pairs_mask = inputs[Properties.neighbor_pairs_mask]
+
+            neighbor_inter = inputs[Properties.neighbor_inter]
+            offset_inter = inputs[Properties.neighbor_offset_inter]
+            neighbor_inter_mask = inputs[Properties.neighbor_inter_mask]
+
+            distances = snn.atom_distances(
+                positions,
+                neighbor_inter,
+                neighbor_mask=neighbor_inter_mask,
+                cell=cell,
+                cell_offsets=offset_inter,
+            )
+
+            pair_dist = torch.ones_like(distances)
+            pair_dist[neighbor_inter_mask != 0] = distances[neighbor_inter_mask != 0]
+            inv_dist = 1/pair_dist[:, :, :]
+            mon_A = np.arange(0, ZA.shape[1], 1)
+            mon_B = np.arange(0, ZB.shape[1], 1)
+
+            pair_dist = pair_dist[:, mon_A, :][:, :, mon_B]
+            inv_dist = inv_dist[:, mon_A, :][:, :, mon_B]
+            pair_dist = torch.reshape(pair_dist, (pair_dist.shape[0], pair_dist.shape[1]*pair_dist.shape[2]))
+            inv_dist = torch.reshape(inv_dist, (inv_dist.shape[0], inv_dist.shape[1]*inv_dist.shape[2]))
+            dists = torch.stack((pair_dist, inv_dist), -1)
+
+            # Get element contributions of the pairs
+            Z_ap = self.ap_Z(Z)
+            Z_ik = snn.neighbor_elements(Z_ap, idx_k)
+
+            # Offset indices
+            offset_idx_j = inputs[Properties.neighbor_offsets_j]
+            offset_idx_k = inputs[Properties.neighbor_offsets_k]
+            
+            # Compute triple distances
+            r_ij, r_ik, r_jk = snn.triple_distances(
+                positions,
+                idx_j,
+                idx_k,
+                offset_idx_j=offset_idx_j,
+                offset_idx_k=offset_idx_k,
+                cell=cell,
+                cell_offsets=offset_inter,
+            )
+            
+            ap_sf = self.APF(
+                r_ij,
+                r_ik,
+                r_jk,
+                elemental_weights=Z_ik,
+                triple_masks=neighbor_pairs_mask,
+            )
+            
+            mon_A = np.arange(0, ZA.shape[1], 1)
+            mon_B = np.arange(ZA.shape[1], ZA.shape[1]+ZB.shape[1], 1)
+            smon_B = np.arange(0, ZB.shape[1], 1)
+            ap_sf_A = ap_sf[:, mon_A, :, :][:, :, smon_B, :]
+            ap_sf_B = ap_sf[:, mon_B, :]
+
+        else:
+            ap_sf = None
+
+        # Concatenate and return symmetry functions
+        #if self.RDF is None:
+        #    symmetry_functions = ap_sf
+        #elif self.APF is None:
+        #    symmetry_functions = radial_sf
+        #else:
+        #    symmetry_functions = torch.cat((radial_sf, ap_sf), 2)
+        return radial_sf_A, radial_sf_B, ap_sf_A, ap_sf_B, dists
 
 class StandardizeSF(nn.Module):
     """
