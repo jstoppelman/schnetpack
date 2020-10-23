@@ -519,14 +519,14 @@ def _convert_atoms(
         mask_triples = np.ones_like(inputs[Properties.neighbor_pairs_j].numpy())
         mask_triples[inputs[Properties.neighbor_pairs_j].numpy() < 0] = 0
         mask_triples[inputs[Properties.neighbor_pairs_k].numpy() < 0] = 0
-        mask_self = np.array([np.where(nbh_idx_k[i] == i)[0] for i in range(nbh_idx_intra.shape[0])])
-        rows = np.repeat(np.arange(0, mask_self.shape[0], 1), mask_self.shape[1])
-        columns = mask_self.flatten()
-        mask_triples[rows, columns] = 0
+
+        mask_self = np.repeat(np.arange(0, nbh_idx_k.shape[0]), nbh_idx_k.shape[1]).reshape(nbh_idx_k.shape[0], nbh_idx_k.shape[1])
+        mask_triples[mask_self == nbh_idx_k] = 0
         inputs[Properties.neighbor_pairs_mask] = torch.LongTensor(mask_triples.astype(np.float))
 
-        mask_self = np.array([np.where(nbh_idx_intra[i] != i)[0] for i in range(nbh_idx_intra.shape[0])])
-        neighborhood_idx = np.array([nbh_idx_intra[i, mask_self[i]] for i in range(nbh_idx_intra.shape[0])])
+        mask_self = np.repeat(np.arange(0, nbh_idx_intra.shape[0]), nbh_idx_intra.shape[1]).reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1])
+        
+        neighborhood_idx = nbh_idx_intra[mask_self_test != nbh_idx_intra].reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1] - 1)
         inputs[Properties.neighbors] = torch.LongTensor(neighborhood_idx.astype(np.int))
 
         inputs[Properties.cell_offset] = torch.FloatTensor(offset_intra.astype(np.float32))

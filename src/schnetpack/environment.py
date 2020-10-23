@@ -91,9 +91,9 @@ class InterEnvironmentProvider(BaseEnvironmentProvider):
         idx_j = np.append(idx_1, idx_2)
         
         uidx = monomer_1.astype(np.int).tolist() + monomer_2.astype(np.int).tolist()
-        mon_list = [monomer_2.shape[0] for i in range(monomer_1.shape[0])]
-        [mon_list.append(monomer_1.shape[0]) for i in range(monomer_2.shape[0])]
-        mon_list = np.asarray(mon_list)
+        mon_list = np.repeat(monomer_2.shape[0], monomer_1.shape[0])
+        mon_list2 = np.repeat(monomer_1.shape[0], monomer_2.shape[0])
+        mon_list = np.append(mon_list, mon_list2)
         mon_list = np.tile(mon_list[:, np.newaxis], (1, n_max))
 
         mon_range = np.tile(
