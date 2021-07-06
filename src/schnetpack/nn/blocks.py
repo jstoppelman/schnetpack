@@ -1,9 +1,9 @@
 import torch
 from torch import nn
-
+import sys
 from schnetpack import Properties
 from schnetpack.nn import shifted_softplus, Dense
-
+import time
 
 __all__ = ["MLP", "TiledMultiLayerNN", "ElementalGate", "GatedNetwork"]
 
@@ -258,9 +258,10 @@ class PairGatedNetwork(nn.Module):
             torch.Tensor: Output of the gated network.
         """
         # At this point, inputs should be the general schnetpack container
+        start = time.time()
         representation = inputs["representation"]
         ZA, ZB, RAB, GA, GB, IA, IB = representation[:]
-
+        
         ZA_oh = self.gate(ZA)
         ZB_oh = self.gate(ZB)
         ZA = torch.cat((ZA.unsqueeze(-1).float(), ZA_oh), 2)
@@ -271,7 +272,7 @@ class PairGatedNetwork(nn.Module):
 
         GB = torch.cat((ZB, GB), 2)
         GB = self.dense_radial(GB)
-
+        
         IA = torch.cat((ZA, IA), 2)
         IB = torch.cat((ZB, IB), 2)
         IA = self.dense_apf(IA)
@@ -289,5 +290,70 @@ class PairGatedNetwork(nn.Module):
 
         output = AB_.add(BA_)
         output = torch.mul(output, RAB[:, :, 1].unsqueeze(-1))
+        
         return output
 
+class PairGatedNetwork_Mod(nn.Module):
+    def __init__(
+        self,
+        nin,
+        nout,
+        elements,
+        n_acsf,
+        n_apf,
+        n_acsf_nodes=100,
+        n_apf_nodes=50,
+        n_hidden=50,
+        n_layers=3,
+        trainable=False,
+        onehot=True,
+        activation=shifted_softplus,
+    ):
+        super(PairGatedNetwork_Mod, self).__init__()
+
+        self.nelem = len(elements)
+        self.gate = ElementalGate(elements, trainable=trainable, onehot=onehot)
+
+        acsf_input = (n_acsf * len(elements)) + len(elements) + 1
+        self.dense_radial = Dense(acsf_input, n_acsf_nodes, activation=activation)
+        apf_input = (n_apf * len(elements)) + len(elements) + 1
+        self.dense_apf = Dense(apf_input, n_apf_nodes, activation=activation)
+
+        dense_input = (n_acsf_nodes + n_apf_nodes + len(elements) + 1 + len(elements) + 1)  + 2
+        self.dense_layers = MLP(
+            dense_input,
+            nout,
+            n_hidden=n_hidden,
+            n_layers=n_layers,
+            activation=activation,
+        )
+
+    def forward(self, inputs):
+        """
+        Args:
+            inputs (dict of torch.Tensor): SchNetPack format dictionary of input tensors.
+
+        Returns:
+            torch.Tensor: Output of the gated network.
+        """
+        # At this point, inputs should be the general schnetpack container
+        representation = inputs["representation"]
+        ZA, ZB, RAB, G, I = representation[:]
+
+        ZA_oh = self.gate(ZA)
+        ZB_oh = self.gate(ZB)
+        ZA = torch.cat((ZA.unsqueeze(-1).float(), ZA_oh), 2)
+        ZB = torch.cat((ZB.unsqueeze(-1).float(), ZB_oh), 2)
+
+        G = torch.cat((ZA, G), 2)
+        G = self.dense_radial(G)
+        I = torch.cat((ZA, I), 2)
+        I = self.dense_apf(I)
+
+        G = torch.cat((G, I), 2)
+
+        AB_ = torch.cat((ZA, ZB, RAB, G), -1)
+        AB_ = self.dense_layers(AB_)
+        
+        output = torch.mul(AB_, RAB[:, :, 1].unsqueeze(-1))
+        return output

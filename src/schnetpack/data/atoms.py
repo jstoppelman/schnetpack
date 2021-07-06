@@ -12,7 +12,7 @@ References
 """
 
 import logging
-import os
+import os, sys
 import warnings
 from base64 import b64encode, b64decode
 
@@ -22,9 +22,9 @@ from ase.db import connect
 from torch.utils.data import Dataset
 
 from schnetpack import Properties
-from schnetpack.environment import SimpleEnvironmentProvider, collect_atom_triples, InterEnvironmentProvider
+from schnetpack.environment import SimpleEnvironmentProvider, collect_atom_triples
 from .partitioning import train_test_split
-
+from schnetpack.nn.neighbors import atom_distances
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -451,7 +451,7 @@ def _convert_atoms(
     inputs[Properties.R] = torch.FloatTensor(positions)
     inputs[Properties.cell] = torch.FloatTensor(cell)
 
-    if type(environment_provider).__name__ != "APNetEnvironmentProvider":
+    if "AP" not in type(environment_provider).__name__:
 
         # get atom environment
         nbh_idx, offsets = environment_provider.get_environment(atoms)
@@ -464,7 +464,9 @@ def _convert_atoms(
 
         # If requested get neighbor lists for triples
         if collect_triples:
+            # Construct possible permutations
             nbh_idx_j, nbh_idx_k, offset_idx_j, offset_idx_k = collect_atom_triples(nbh_idx)
+
             inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
             inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
 
@@ -474,8 +476,224 @@ def _convert_atoms(
             inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
                 offset_idx_k.astype(np.int)
             )
-    
+
+    elif type(environment_provider).__name__ == "APModEnvironmentProvider":
+        # get atom environment
+        nbh_idx, offsets = environment_provider.get_environment(atoms)
+        
+        # Get neighbors and neighbor mask
+        inputs[Properties.neighbors] = torch.LongTensor(nbh_idx.astype(np.int))
+
+        # Get cells
+        inputs[Properties.cell_offset] = torch.FloatTensor(offsets.astype(np.float32))
+        ZB = atoms.numbers.astype(np.int)
+        natoms, nneigh = nbh_idx.shape
+        ZB = np.tile(
+                ZB[np.newaxis], (natoms, 1)
+            )
+
+        ZB = ZB[
+                ~np.eye(natoms, dtype=np.bool)
+            ].reshape(natoms, natoms - 1)
+
+        inputs["ZB"] = torch.LongTensor(ZB)
+
+        # If requested get neighbor lists for triples
+        if collect_triples:
+
+            # Construct possible permutations
+            nbh_idx_j = np.tile(nbh_idx, nneigh)
+            nbh_idx_k = np.repeat(nbh_idx, nneigh).reshape((natoms, -1))
+
+            nbh_idx_j_tmp = nbh_idx_j[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+            nbh_idx_k_tmp = nbh_idx_k[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+
+            # Keep track of periodic images
+            offset_idx = np.tile(np.arange(nneigh), (natoms, 1))
+
+            # Construct indices for pairs of offsets
+            offset_idx_j = np.tile(offset_idx, nneigh)
+            offset_idx_k = np.repeat(offset_idx, nneigh).reshape((natoms, -1))
+
+            offset_idx_j_tmp = offset_idx_j[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+            offset_idx_k_tmp = offset_idx_k[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+
+            inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j_tmp.astype(np.int))
+            inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k_tmp.astype(np.int))
+
+            inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
+                offset_idx_j_tmp.astype(np.int)
+            )
+            inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
+                offset_idx_k_tmp.astype(np.int)
+            )
+        
+        """
+        # If requested get neighbor lists for triples
+        if collect_triples:
+            # Construct possible permutations
+            nbh_idx_j, nbh_idx_k, offset_idx_j, offset_idx_k = collect_atom_triples(nbh_idx)
+
+            inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
+            inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
+
+            inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
+                offset_idx_j.astype(np.int)
+            )
+            inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
+                offset_idx_k.astype(np.int)
+            )
+        """
+    elif type(environment_provider).__name__ == "APModPBCEnvironmentProvider":
+        # get atom environment
+        nbh_idx, offsets = environment_provider.get_environment(atoms)
+
+        # Get neighbors and neighbor mask
+        inputs[Properties.neighbors] = torch.LongTensor(nbh_idx.astype(np.int))
+
+        neighbor_test = inputs[Properties.neighbors].unsqueeze(0)
+        pos_test = inputs[Properties.R].unsqueeze(0)
+        cell_test = inputs[Properties.cell].unsqueeze(0)
+
+        # Get cells
+        inputs[Properties.cell_offset] = torch.FloatTensor(offsets.astype(np.float32))
+        offset_test = torch.FloatTensor(offsets.astype(np.float32)).unsqueeze(0)
+
+        distances, displacement = atom_distances(pos_test, neighbor_test, cell_test, offset_test, return_vecs=True)
+        displacement = displacement.squeeze(0)
+
+        #only works for orthorhombic box
+        box_shift = -torch.round(displacement/cell_test[0, 0, 0])
+        inputs[Properties.cell_offset] = torch.FloatTensor(box_shift)
+
+        ZB = atoms.numbers.astype(np.int)
+        natoms, nneigh = nbh_idx.shape
+        ZB = np.tile(
+                ZB[np.newaxis], (natoms, 1)
+            )
+
+        ZB = ZB[
+                ~np.eye(natoms, dtype=np.bool)
+            ].reshape(natoms, natoms - 1)
+
+        inputs["ZB"] = torch.LongTensor(ZB)
+
+        # If requested get neighbor lists for triples
+        if collect_triples:
+
+            # Construct possible permutations
+            nbh_idx_j = np.tile(nbh_idx, nneigh)
+            nbh_idx_k = np.repeat(nbh_idx, nneigh).reshape((natoms, -1))
+
+            nbh_idx_j_tmp = nbh_idx_j[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+            nbh_idx_k_tmp = nbh_idx_k[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+
+            # Keep track of periodic images
+            offset_idx = np.tile(np.arange(nneigh), (natoms, 1))
+
+            # Construct indices for pairs of offsets
+            offset_idx_j = np.tile(offset_idx, nneigh)
+            offset_idx_k = np.repeat(offset_idx, nneigh).reshape((natoms, -1))
+
+            offset_idx_j_tmp = offset_idx_j[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+            offset_idx_k_tmp = offset_idx_k[nbh_idx_j != nbh_idx_k].reshape(natoms, nneigh*(nneigh-1))
+
+            inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j_tmp.astype(np.int))
+            inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k_tmp.astype(np.int))
+
+            inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
+                offset_idx_j_tmp.astype(np.int)
+            )
+            inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
+                offset_idx_k_tmp.astype(np.int)
+            )
+
+
+    elif type(environment_provider).__name__ == "APNetPBCEnvironmentProvider":
+        if res_list is not None:
+            monA = len(res_list[0])
+            monB = len(res_list[1])
+            inputs['ZA'] = torch.LongTensor(atoms.numbers[0:monA].astype(np.int))
+            inputs['ZB'] = torch.LongTensor(atoms.numbers[monA:monA+monB].astype(np.int))
+
+        inputs['ZA'], inputs['ZB'] = inputs['ZA'].long(), inputs['ZB'].long()
+
+        # get atom environment
+        nbh_idx_intra, offset_intra, nbh_idx_inter, offsets_inter = environment_provider.get_environment(atoms, inputs)
+        
+        # Get neighbors and neighbor mask
+        inputs[Properties.neighbor_inter] = torch.LongTensor(nbh_idx_inter.astype(np.int))
+
+        mask = inputs[Properties.neighbor_inter] >= 0
+        inputs[Properties.neighbor_inter_mask] = mask.float()
+        inputs[Properties.neighbor_inter] = (
+            inputs[Properties.neighbor_inter] * inputs[Properties.neighbor_inter_mask].long()
+        )
+
+        neighbor_test = inputs[Properties.neighbor_inter].unsqueeze(0)
+        pos_test = inputs[Properties.R].unsqueeze(0)
+        cell_test = inputs[Properties.cell].unsqueeze(0)
+
+        # Get cells
+        offset_test = torch.FloatTensor(offsets_inter.astype(np.float32)).unsqueeze(0)
+
+        distances, displacement = atom_distances(pos_test, neighbor_test, cell_test, offset_test, return_vecs=True)
+        displacement = displacement.squeeze(0)
+
+        #only works for orthorhombic box
+        box_shift = -torch.round(displacement/cell_test[0, 0, 0])
+        distances = atom_distances(pos_test, neighbor_test, cell_test, box_shift.unsqueeze(0))
+        inputs[Properties.neighbor_offset_inter] = torch.FloatTensor(box_shift)
+
+        natoms, nneigh = nbh_idx_inter.shape
+        nbh_idx_k = np.tile(nbh_idx_intra, nneigh)
+        nbh_idx_j = np.repeat(nbh_idx_inter, nneigh).reshape((natoms, -1))
+
+        offset_idx = np.tile(np.arange(nneigh), (natoms, 1))
+        offset_idx_k = np.tile(offset_idx, nneigh)
+        offset_idx_j = np.repeat(offset_idx, nneigh).reshape((natoms, -1))
+
+        inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
+        inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
+
+        inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
+            offset_idx_j.astype(np.int)
+        )
+        inputs[Properties.neighbor_offsets_k] = torch.LongTensor(
+            offset_idx_k.astype(np.int)
+        )
+
+        mask_triples = np.ones_like(inputs[Properties.neighbor_pairs_j].numpy())
+        mask_triples[inputs[Properties.neighbor_pairs_j].numpy() < 0] = 0
+        mask_triples[inputs[Properties.neighbor_pairs_k].numpy() < 0] = 0
+
+        neighbor_test = torch.LongTensor(nbh_idx_intra.astype(np.int)).unsqueeze(0)
+        pos_test = inputs[Properties.R].unsqueeze(0)
+        cell_test = inputs[Properties.cell].unsqueeze(0)
+
+        # Get cells
+        offset_test = torch.FloatTensor(offset_intra.astype(np.float32)).unsqueeze(0)
+
+        distances, displacement = atom_distances(pos_test, neighbor_test, cell_test, offset_test, return_vecs=True)
+        displacement = displacement.squeeze(0)
+
+        #only works for orthorhombic box
+        box_shift = -torch.round(displacement/cell_test[0, 0, 0])
+        inputs[Properties.cell_offset_intra] = torch.FloatTensor(box_shift)
+
+        mask_self = np.repeat(np.arange(0, nbh_idx_k.shape[0]), nbh_idx_k.shape[1]).reshape(nbh_idx_k.shape[0], nbh_idx_k.shape[1])
+        mask_triples[mask_self == nbh_idx_k] = 0
+        inputs[Properties.neighbor_pairs_mask] = torch.LongTensor(mask_triples.astype(np.float))
+        
+        mask_self = np.repeat(np.arange(0, nbh_idx_intra.shape[0]), nbh_idx_intra.shape[1]).reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1])
+        neighborhood_idx = nbh_idx_intra[mask_self != nbh_idx_intra].reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1] - 1)
+        inputs[Properties.neighbors] = torch.LongTensor(neighborhood_idx.astype(np.int))
+
+        box_shift = box_shift[mask_self != nbh_idx_intra, :].reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1] - 1, 3)
+        inputs[Properties.cell_offset] = torch.FloatTensor(box_shift)
+
     else:
+        
         if res_list is not None:
             monA = len(res_list[0])
             monB = len(res_list[1])
@@ -486,7 +704,9 @@ def _convert_atoms(
 
         # get atom environment
         nbh_idx_intra, offset_intra, nbh_idx_inter, offsets_inter = environment_provider.get_environment(atoms, inputs)
-
+        nbh_idx_test, offset_test = SimpleEnvironmentProvider().get_environment(atoms)
+        #print(nbh_idx_test[0, :])
+        #sys.exit()
         # Get neighbors and neighbor mask
         inputs[Properties.neighbor_inter] = torch.LongTensor(nbh_idx_inter.astype(np.int))
         
@@ -506,8 +726,9 @@ def _convert_atoms(
         offset_idx = np.tile(np.arange(nneigh), (natoms, 1))
         offset_idx_k = np.tile(offset_idx, nneigh)
         offset_idx_j = np.repeat(offset_idx, nneigh).reshape((natoms, -1))
+
         inputs[Properties.neighbor_pairs_j] = torch.LongTensor(nbh_idx_j.astype(np.int))
-        inputs[Properties.neighbor_pairs_k] = torch.LongTensor(offset_idx_k.astype(np.int))
+        inputs[Properties.neighbor_pairs_k] = torch.LongTensor(nbh_idx_k.astype(np.int))
 
         inputs[Properties.neighbor_offsets_j] = torch.LongTensor(
             offset_idx_j.astype(np.int)
@@ -524,13 +745,14 @@ def _convert_atoms(
         mask_triples[mask_self == nbh_idx_k] = 0
         inputs[Properties.neighbor_pairs_mask] = torch.LongTensor(mask_triples.astype(np.float))
 
-        mask_self = np.repeat(np.arange(0, nbh_idx_intra.shape[0]), nbh_idx_intra.shape[1]).reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1])
-        
-        neighborhood_idx = nbh_idx_intra[mask_self_test != nbh_idx_intra].reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1] - 1)
+        mask_self = np.repeat(np.arange(0, nbh_idx_intra.shape[0]), nbh_idx_intra.shape[1]).reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1])     
+        neighborhood_idx = nbh_idx_intra[mask_self != nbh_idx_intra].reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1] - 1)
         inputs[Properties.neighbors] = torch.LongTensor(neighborhood_idx.astype(np.int))
 
-        inputs[Properties.cell_offset] = torch.FloatTensor(offset_intra.astype(np.float32))
+        inputs[Properties.cell_offset_intra] = torch.FloatTensor(offset_intra.astype(np.float32))
 
+        offset_intra = offset_intra[mask_self != nbh_idx_intra, :].reshape(nbh_idx_intra.shape[0], nbh_idx_intra.shape[1] - 1, 3)
+        inputs[Properties.cell_offset] = torch.FloatTensor(offset_intra.astype(np.float32))
     return inputs
 
 class AtomsConverter:
@@ -581,7 +803,7 @@ class AtomsConverter:
             mask_triples[inputs[Properties.neighbor_pairs_j] < 0] = 0
             mask_triples[inputs[Properties.neighbor_pairs_k] < 0] = 0
             inputs[Properties.neighbor_pairs_mask] = mask_triples.float()
-
+        
         # Add batch dimension and move to CPU/GPU
         for key, value in inputs.items():
             inputs[key] = value.unsqueeze(0).to(self.device)

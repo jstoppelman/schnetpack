@@ -9,6 +9,11 @@ __all__ = [
     "SimpleEnvironmentProvider",
     "AseEnvironmentProvider",
     "TorchEnvironmentProvider",
+    "APNetEnvironmentProvider",
+    "InterEnvironmentProvider",
+    "APModEnvironmentProvider",
+    "APModPBCEnvironmentProvider",
+    "APNetPBCEnvironmentProvider"
 ]
 
 
@@ -47,7 +52,7 @@ class SimpleEnvironmentProvider(BaseEnvironmentProvider):
     """
 
     def get_environment(self, atoms, grid=None):
-        n_atoms = atoms.get_number_of_atoms()
+        n_atoms = atoms.get_global_number_of_atoms()
 
         if n_atoms == 1:
             neighborhood_idx = -np.ones((1, 1), dtype=np.float32)
@@ -73,9 +78,8 @@ class SimpleEnvironmentProvider(BaseEnvironmentProvider):
                 (neighborhood_idx.shape[0], neighborhood_idx.shape[1], 3),
                 dtype=np.float32,
             )
-        
         return neighborhood_idx, offsets
-    
+
 class InterEnvironmentProvider(BaseEnvironmentProvider):
 
     def get_environment(self, atoms, inputs):
@@ -89,7 +93,7 @@ class InterEnvironmentProvider(BaseEnvironmentProvider):
         idx_1 = np.tile(monomer_2, monomer_1.shape[0])
         idx_2 = np.tile(monomer_1, monomer_2.shape[0])
         idx_j = np.append(idx_1, idx_2)
-        
+
         uidx = monomer_1.astype(np.int).tolist() + monomer_2.astype(np.int).tolist()
         mon_list = np.repeat(monomer_2.shape[0], monomer_1.shape[0])
         mon_list2 = np.repeat(monomer_1.shape[0], monomer_2.shape[0])
@@ -121,7 +125,7 @@ class APNetEnvironmentProvider(BaseEnvironmentProvider):
 
         monomer_1 = np.arange(0, ZA.shape[0], 1)
         monomer_2 = np.arange(ZA.shape[0], ZA.shape[0]+ZB.shape[0], 1)
-        
+
         idx_1 = np.tile(monomer_1, monomer_1.shape[0])
         idx_2 = np.tile(monomer_2, monomer_2.shape[0])
         idx_j = np.append(idx_1, idx_2)
@@ -141,8 +145,117 @@ class APNetEnvironmentProvider(BaseEnvironmentProvider):
         nbh_intra_idx = -np.ones((n_atoms, np.max(n_max)), dtype=np.float32)
         nbh_intra_idx[mask] = idx_j
 
-        offset_intra = np.zeros((n_atoms, np.max(n_max)-1, 3), dtype=np.float32)
+        offset_intra = np.zeros((n_atoms, np.max(n_max), 3), dtype=np.float32)
         return nbh_intra_idx, offset_intra, nbh_idx_inter, offsets_inter
+
+class APNetPBCEnvironmentProvider(BaseEnvironmentProvider):
+
+    def get_environment(self, atoms, inputs):
+        n_atoms = atoms.get_number_of_atoms()
+        ZA, ZB = inputs['ZA'], inputs['ZB']
+        n_atoms_A, n_atoms_B = ZA.shape[0], ZB.shape[0]
+        n_max = max(ZA.shape[0], ZB.shape[0])
+
+        inter_env = InterEnvironmentProvider()
+        nbh_idx_inter, offsets_inter = inter_env.get_environment(atoms, inputs)
+
+        monomer_1 = np.arange(0, ZA.shape[0], 1)
+        monomer_2 = np.arange(ZA.shape[0], ZA.shape[0]+ZB.shape[0], 1)
+
+        idx_1 = np.tile(monomer_1, monomer_1.shape[0])
+        idx_2 = np.tile(monomer_2, monomer_2.shape[0])
+        idx_j = np.append(idx_1, idx_2)
+
+        uidx = monomer_1.astype(np.int).tolist() + monomer_2.astype(np.int).tolist()
+        mon_list_A = np.repeat(monomer_1.shape[0], monomer_1.shape[0])
+        mon_list_B = np.repeat(monomer_2.shape[0], monomer_2.shape[0])
+        mon_list = np.append(mon_list_A, mon_list_B)
+        mon_list = np.tile(mon_list[:, np.newaxis], (1, n_max))
+
+        mon_range = np.tile(
+                np.arange(n_max, dtype=np.int)[np.newaxis], (mon_list.shape[0], 1)
+            )
+
+        mask = np.zeros((n_atoms, np.max(n_max)), dtype=np.bool)
+        mask[uidx, :] = mon_range < mon_list
+        nbh_intra_idx = -np.ones((n_atoms, np.max(n_max)), dtype=np.float32)
+        nbh_intra_idx[mask] = idx_j
+
+        offset_intra = np.zeros((n_atoms, np.max(n_max), 3), dtype=np.float32)
+        return nbh_intra_idx, offset_intra, nbh_idx_inter, offsets_inter
+
+class APModEnvironmentProvider(BaseEnvironmentProvider):
+    """
+    A simple environment provider for small molecules where all atoms are each
+    other's neighbors. It calculates full distance matrices and does not
+    support cutoffs or periodic boundary conditions.
+    """
+
+    def get_environment(self, atoms, grid=None):
+        n_atoms = atoms.get_number_of_atoms()
+
+        if n_atoms == 1:
+            neighborhood_idx = -np.ones((1, 1), dtype=np.float32)
+            offsets = np.zeros((n_atoms, 1, 3), dtype=np.float32)
+        else:
+            neighborhood_idx = np.tile(
+                np.arange(n_atoms, dtype=np.float32)[np.newaxis], (n_atoms, 1)
+            )
+
+            neighborhood_idx = neighborhood_idx[
+                ~np.eye(n_atoms, dtype=np.bool)
+            ].reshape(n_atoms, n_atoms - 1)
+
+            if grid is not None:
+                n_grid = grid.shape[0]
+                neighborhood_idx = np.hstack([neighborhood_idx, -np.ones((n_atoms, 1))])
+                grid_nbh = np.tile(
+                    np.arange(n_atoms, dtype=np.float32)[np.newaxis], (n_grid, 1)
+                )
+                neighborhood_idx = np.vstack([neighborhood_idx, grid_nbh])
+
+            offsets = np.zeros(
+                (neighborhood_idx.shape[0], neighborhood_idx.shape[1], 3),
+                dtype=np.float32,
+            )
+
+        return neighborhood_idx, offsets
+
+class APModPBCEnvironmentProvider(BaseEnvironmentProvider):
+    """
+    Works the same way as APModEnvironmentProvider, this just provides
+    another class name for use in atoms.py _convert_atoms
+    """
+
+    def get_environment(self, atoms, grid=None):
+        n_atoms = atoms.get_number_of_atoms()
+
+        if n_atoms == 1:
+            neighborhood_idx = -np.ones((1, 1), dtype=np.float32)
+            offsets = np.zeros((n_atoms, 1, 3), dtype=np.float32)
+        else:
+            neighborhood_idx = np.tile(
+                np.arange(n_atoms, dtype=np.float32)[np.newaxis], (n_atoms, 1)
+            )
+
+            neighborhood_idx = neighborhood_idx[
+                ~np.eye(n_atoms, dtype=np.bool)
+            ].reshape(n_atoms, n_atoms - 1)
+
+            if grid is not None:
+                n_grid = grid.shape[0]
+                neighborhood_idx = np.hstack([neighborhood_idx, -np.ones((n_atoms, 1))])
+                grid_nbh = np.tile(
+                    np.arange(n_atoms, dtype=np.float32)[np.newaxis], (n_grid, 1)
+                )
+                neighborhood_idx = np.vstack([neighborhood_idx, grid_nbh])
+
+            offsets = np.zeros(
+                (neighborhood_idx.shape[0], neighborhood_idx.shape[1], 3),
+                dtype=np.float32,
+            )
+
+        return neighborhood_idx, offsets
 
 class AseEnvironmentProvider(BaseEnvironmentProvider):
     """
@@ -157,21 +270,20 @@ class AseEnvironmentProvider(BaseEnvironmentProvider):
     def get_environment(self, atoms, grid=None):
         if grid is not None:
             raise NotImplementedError
-        
-        n_atoms = atoms.get_number_of_atoms()
+
+        n_atoms = atoms.get_global_number_of_atoms()
         idx_i, idx_j, idx_S = neighbor_list(
             "ijS", atoms, self.cutoff, self_interaction=False
         )
-        
         if idx_i.shape[0] > 0:
             uidx, n_nbh = np.unique(idx_i, return_counts=True)
             n_max_nbh = np.max(n_nbh)
-            
+
             n_nbh = np.tile(n_nbh[:, np.newaxis], (1, n_max_nbh))
             nbh_range = np.tile(
                 np.arange(n_max_nbh, dtype=np.int)[np.newaxis], (n_nbh.shape[0], 1)
             )
-            
+
             mask = np.zeros((n_atoms, np.max(n_max_nbh)), dtype=np.bool)
             mask[uidx, :] = nbh_range < n_nbh
             neighborhood_idx = -np.ones((n_atoms, np.max(n_max_nbh)), dtype=np.float32)
@@ -182,6 +294,7 @@ class AseEnvironmentProvider(BaseEnvironmentProvider):
         else:
             neighborhood_idx = -np.ones((n_atoms, 1), dtype=np.float32)
             offset = np.zeros((n_atoms, 1, 3), dtype=np.float32)
+
         return neighborhood_idx, offset
 
 
@@ -208,12 +321,14 @@ class TorchEnvironmentProvider(BaseEnvironmentProvider):
         species = torch.FloatTensor(atoms.numbers).to(self.device)
         coordinates = torch.FloatTensor(atoms.positions).to(self.device)
         pbc = torch.from_numpy(atoms.pbc.astype("uint8")).to(self.device)
+
         if not atoms.cell.any():
             cell = torch.eye(3, dtype=species.dtype).to(self.device)
         else:
             cell = torch.Tensor(atoms.cell).to(self.device)
 
         shifts = compute_shifts(cell=cell, pbc=pbc, cutoff=self.cutoff)
+
         # The returned indices are only one directional
         idx_i, idx_j, idx_S = neighbor_pairs(
             species == -1, coordinates, cell, shifts, self.cutoff
@@ -226,9 +341,9 @@ class TorchEnvironmentProvider(BaseEnvironmentProvider):
         # Create bidirectional id arrays, similar to what the ASE neighbor_list returns
         bi_idx_i = np.hstack((idx_i, idx_j))
         bi_idx_j = np.hstack((idx_j, idx_i))
-        bi_idx_S = np.vstack((idx_S, -idx_S[::-1]))
+        bi_idx_S = np.vstack((-idx_S, idx_S))
 
-        n_atoms = atoms.get_number_of_atoms()
+        n_atoms = atoms.get_global_number_of_atoms()
         if bi_idx_i.shape[0] > 0:
             uidx, n_nbh = np.unique(bi_idx_i, return_counts=True)
             n_max_nbh = np.max(n_nbh)
@@ -241,10 +356,15 @@ class TorchEnvironmentProvider(BaseEnvironmentProvider):
             mask = np.zeros((n_atoms, np.max(n_max_nbh)), dtype=np.bool)
             mask[uidx, :] = nbh_range < n_nbh
             neighborhood_idx = -np.ones((n_atoms, np.max(n_max_nbh)), dtype=np.float32)
-            neighborhood_idx[mask] = bi_idx_j
-
             offset = np.zeros((n_atoms, np.max(n_max_nbh), 3), dtype=np.float32)
-            offset[mask] = bi_idx_S
+
+            # Assign neighbors and offsets according to the indices in bi_idx_i, since in contrast
+            # to the ASE provider the bidirectional arrays are no longer sorted.
+            # TODO: There might be a more efficient way of doing this than a loop
+            for idx in range(n_atoms):
+                neighborhood_idx[idx, mask[idx]] = bi_idx_j[bi_idx_i == idx]
+                offset[idx, mask[idx]] = bi_idx_S[bi_idx_i == idx]
+
         else:
             neighborhood_idx = -np.ones((n_atoms, 1), dtype=np.float32)
             offset = np.zeros((n_atoms, 1, 3), dtype=np.float32)
@@ -276,10 +396,12 @@ def compute_shifts(cell, pbc, cutoff):
     inv_distances = reciprocal_cell.norm(2, -1)
     num_repeats = torch.ceil(cutoff * inv_distances).to(torch.long)
     num_repeats = torch.where(pbc, num_repeats, torch.zeros_like(num_repeats))
+
     r1 = torch.arange(1, num_repeats[0] + 1, device=cell.device)
     r2 = torch.arange(1, num_repeats[1] + 1, device=cell.device)
     r3 = torch.arange(1, num_repeats[2] + 1, device=cell.device)
     o = torch.zeros(1, dtype=torch.long, device=cell.device)
+
     return torch.cat(
         [
             torch.cartesian_prod(r1, r2, r3),
@@ -332,19 +454,21 @@ def neighbor_pairs(padding_mask, coordinates, cell, shifts, cutoff):
     shift_index, p1, p2 = torch.cartesian_prod(all_shifts, all_atoms, all_atoms).unbind(
         -1
     )
-    shifts_outide = shifts.index_select(0, shift_index)
+    shifts_outside = shifts.index_select(0, shift_index)
 
     # Step 4: combine results for all cells
-    shifts_all = torch.cat([shifts_center, shifts_outide])
+    shifts_all = torch.cat([shifts_center, shifts_outside])
     p1_all = torch.cat([p1_center, p1])
     p2_all = torch.cat([p2_center, p2])
+
     shift_values = torch.mm(shifts_all.to(cell.dtype), cell)
 
     # step 5, compute distances, and find all pairs within cutoff
     distances = (coordinates[p1_all] - coordinates[p2_all] + shift_values).norm(2, -1)
+
     padding_mask = (padding_mask[p1_all]) | (padding_mask[p2_all])
     distances.masked_fill_(padding_mask, math.inf)
-    in_cutoff = (distances <= cutoff).nonzero()
+    in_cutoff = torch.nonzero(distances < cutoff, as_tuple=False)
     pair_index = in_cutoff.squeeze()
     atom_index1 = p1_all[pair_index]
     atom_index2 = p2_all[pair_index]
@@ -389,3 +513,44 @@ def collect_atom_triples(nbh_idx):
     offset_idx_k = offset_idx_k[:, triu_idx_flat]
 
     return nbh_idx_j, nbh_idx_k, offset_idx_j, offset_idx_k
+
+
+def collect_atom_triples_batch(neighbors, neighbor_mask):
+    """
+    Batch/torch version for collecting atom triples, offset indices and the corresponding mask directly from a
+    batch of neighbor indices and their corresponding mask. This is e.g. used in the
+    schnetpack.md.calculators.SchnetPackCalculator class to generate extended inputs for Behler type symmetry
+    functions.
+    Args:
+        neighbors (torch.LongTensor): (n_batch x n_atoms x n_neighbors) tensor holding the indices of all
+                                      neighbor atoms (e.g. from NeighborList or EnvironmentProvider).
+        neighbor_mask (torch.LongTensor): (n_batch x n_atoms x n_neighbors) binary tensor indicating non-existent
+                                          atoms due to padding.
+    Returns:
+        torch.LongTensor: (n_batch x n_atoms x n_triples) indices of the first neighbor in all triples.
+        torch.LongTensor: (n_batch x n_atoms x n_triples) indices of the second neighbor in all triples.
+        torch.LongTensor: (n_batch x n_atoms x n_triples) first neighbor offset indices for PBC.
+        torch.LongTensor: (n_batch x n_atoms x n_triples) second neighbor offset indices for PBC.
+        torch.LongTensor: (n_batch x n_atoms x n_triples) mask indicating all invalid pairs due to padding.
+    """
+    B, A, N = neighbors.shape
+
+    # Generate indices of all possible unique pairs
+    idx_k, idx_j = torch.combinations(
+        torch.arange(N, device=neighbors.device).long(), r=2, with_replacement=False
+    ).unbind(1)
+
+    # Generate triple indices
+    nbh_idx_j = neighbors[:, :, idx_j]
+    nhb_idx_k = neighbors[:, :, idx_k]
+
+    # Generate triple offset indices
+    offset_idx_j = idx_j.repeat((B, A, 1))
+    offset_idx_k = idx_k.repeat((B, A, 1))
+
+    # Generate mask for triples
+    mask_j = neighbor_mask[:, :, idx_j]
+    mask_k = neighbor_mask[:, :, idx_k]
+    mask_triples = mask_j * mask_k
+
+    return nbh_idx_j, nhb_idx_k, offset_idx_j, offset_idx_k, mask_triples

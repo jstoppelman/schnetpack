@@ -125,12 +125,12 @@ class System:
         # 1) Get maximum number of molecules, number of replicas and number of
         #    overall systems
         self.n_molecules = len(molecules)
-
+        
         # 2) Construct array with number of atoms in each molecule
         self.n_atoms = torch.zeros(
             self.n_molecules, dtype=torch.long, device=self.device
         )
-
+        
         for i in range(self.n_molecules):
             self.n_atoms[i] = molecules[i].get_number_of_atoms()
 
@@ -169,6 +169,77 @@ class System:
             # Dynamic properties
             self.positions[:, i, : self.n_atoms[i], :] = torch.from_numpy(
                 molecules[i].positions * MDUnits.angs2bohr
+            )
+
+        # 6) Do proper broadcasting here for easier use in e.g. integrators and
+        #    thermostats afterwards
+        self.masses = self.masses[None, :, :, None]
+        self.atom_masks = self.atom_masks[..., None]
+
+        # 7) Build neighbor lists
+        if self.neighbor_list is not None:
+            self.neighbor_list = self.neighbor_list(self)
+
+        # 8) Initialize Momenta
+        if self.initializer:
+            self.initializer.initialize_system(self)
+
+    def load_molecule(self, molecule):
+        """
+        Initializes all required variables and tensors based on an ASE atom object.
+
+        Args:
+            molecule list(ase.Atom): ASE atom object containing
+            molecular structures and chemical elements.
+        """
+
+        # 1) Get maximum number of molecules, number of replicas and number of
+        #    overall systems
+        self.n_molecules = 1
+
+        # 2) Construct array with number of atoms in each molecule
+        self.n_atoms = torch.zeros(
+            self.n_molecules, dtype=torch.long, device=self.device
+        )
+
+        for i in range(self.n_molecules):
+            self.n_atoms[i] = molecule.get_global_number_of_atoms()
+
+        # 3) Determine the maximum number of atoms present (in case of
+        #    differently sized molecules)
+        self.max_n_atoms = int(torch.max(self.n_atoms))
+
+        # 4) Construct basic properties and masks
+        self.atom_types = torch.zeros(
+            self.n_replicas, self.n_molecules, self.max_n_atoms, device=self.device
+        ).long()
+        self.atom_masks = torch.zeros(
+            self.n_replicas, self.n_molecules, self.max_n_atoms, device=self.device
+        )
+        self.masses = torch.ones(self.n_molecules, self.max_n_atoms, device=self.device)
+
+        # Relevant for dynamic properties: positions, momenta, forces
+        self.positions = torch.zeros(
+            self.n_replicas, self.n_molecules, self.max_n_atoms, 3, device=self.device
+        )
+        self.momenta = torch.zeros(
+            self.n_replicas, self.n_molecules, self.max_n_atoms, 3, device=self.device
+        )
+
+        # 5) Populate arrays according to the data provided in molecules
+        for i in range(self.n_molecules):
+            # Static properties
+            self.atom_types[:, i, : self.n_atoms[i]] = torch.from_numpy(
+                molecule.get_atomic_numbers()
+            )
+            self.atom_masks[:, i, : self.n_atoms[i]] = 1.0
+            self.masses[i, : self.n_atoms[i]] = torch.from_numpy(
+                molecule.get_masses() * MDUnits.d2amu
+            )
+
+            # Dynamic properties
+            self.positions[:, i, : self.n_atoms[i], :] = torch.from_numpy(
+                molecule.positions * MDUnits.angs2bohr
             )
 
         # 6) Do proper broadcasting here for easier use in e.g. integrators and

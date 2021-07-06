@@ -374,7 +374,14 @@ class SetupCalculator(SetupBlock):
             model_path = os.path.join(model_path, "best_model")
 
         # Load model
-        model = schnetpack.utils.load_model(model_path, map_location=device)
+        model = torch.load(model_path, map_location=device)
+
+        # Load model. If no gpu is available, load it on cpu by default
+        # if not torch.cuda.is_available():
+        #     model = torch.load(model_path, map_location="cpu")
+        # else:
+        #     model = torch.load(model_path)
+
         logging.info("Loaded model from {:s}".format(model_path))
 
         return model

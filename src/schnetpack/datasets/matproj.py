@@ -33,6 +33,7 @@ class MaterialsProject(DownloadableAtomsData):
     """
 
     # properties
+    Energy = "energy"
     EformationPerAtom = "formation_energy_per_atom"
     EPerAtom = "energy_per_atom"
     BandGap = "band_gap"
@@ -50,6 +51,7 @@ class MaterialsProject(DownloadableAtomsData):
     ):
 
         available_properties = [
+            MaterialsProject.Energy,
             MaterialsProject.EformationPerAtom,
             MaterialsProject.EPerAtom,
             MaterialsProject.BandGap,
@@ -119,6 +121,7 @@ class MaterialsProject(DownloadableAtomsData):
                             },
                             properties=[
                                 "structure",
+                                "energy",
                                 "energy_per_atom",
                                 "formation_energy_per_atom",
                                 "total_magnetization",
@@ -140,6 +143,7 @@ class MaterialsProject(DownloadableAtomsData):
                                 con.write(
                                     at,
                                     data={
+                                        MaterialsProject.Energy: q["energy"],
                                         MaterialsProject.EPerAtom: q["energy_per_atom"],
                                         MaterialsProject.EformationPerAtom: q[
                                             "formation_energy_per_atom"

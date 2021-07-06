@@ -3,7 +3,7 @@ import torch
 from torch import nn
 
 
-__all__ = ["CosineCutoff", "MollifierCutoff", "HardCutoff", "get_cutoff_by_string"]
+__all__ = ["CosineCutoff", "MollifierCutoff", "HardCutoff", "get_cutoff_by_string", "FermiDirac"]
 
 
 def get_cutoff_by_string(key):
@@ -122,3 +122,17 @@ class HardCutoff(nn.Module):
         """
         mask = (distances <= self.cutoff).float()
         return mask
+
+class FermiDirac(nn.Module):
+    """
+    Use Fermi-Dirac function as a cutoff
+    """
+    def __init__(self, beta=10.0, mu=1.0, muf=2.0):
+        super(FermiDirac, self).__init__()
+        self.register_buffer("beta", torch.FloatTensor([beta]))
+        self.register_buffer("mu", torch.FloatTensor([mu]))
+        self.register_buffer("muf", torch.FloatTensor([muf]))
+
+    def forward(self, distances):
+        cutoff = 1/(torch.exp(self.beta*(distances - self.muf*self.mu)) + 1.0) 
+        return cutoff

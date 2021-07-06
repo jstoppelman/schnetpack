@@ -31,10 +31,11 @@ class MDUnits:
 
     # For spectra
     h_bar2icm = hbar * 100 * units._c * units._aut
-
+    
     # Conversion units use when reading in MD inputs
     conversions = {
         "kcal": units.kcal / units.Hartree,
+        "kj" : units.kJ / units.Hartree,
         "mol": 1 / units.mol,
         "ev": units.eV / units.Hartree,
         "bohr": 1.0,

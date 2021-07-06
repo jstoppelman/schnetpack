@@ -9,6 +9,7 @@ __all__ = [
     "GaussianSmearing",
     "RadialDistribution",
     "APDistribution",
+    "APDistribution_Mod",
 ]
 
 
@@ -72,7 +73,7 @@ class AngularDistribution(nn.Module):
         cos_theta = (torch.pow(r_ij, 2) + torch.pow(r_ik, 2) - torch.pow(r_jk, 2)) / (
             2.0 * r_ij * r_ik
         )
-        
+
         # Required in order to catch NaNs during backprop
         if triple_masks is not None:
             cos_theta[triple_masks == 0] = 0.0
@@ -137,10 +138,12 @@ class APDistribution(nn.Module):
         self,
         radial_filter,
         cutoff_functions=CosineCutoff,
+        #cutoff_function2=None
     ):
         super(APDistribution, self).__init__()
         self.radial_filter = radial_filter
         self.cutoff_function = cutoff_functions
+        #self.cutoff_function2 = cutoff_function2
 
     def forward(self, r_ij, r_ik, r_jk, triple_masks=None, elemental_weights=None):
         nbatch, natoms, npairs = r_ij.size()
@@ -150,7 +153,7 @@ class APDistribution(nn.Module):
         cos_theta = (torch.pow(r_ij, 2) + torch.pow(r_ik, 2) - torch.pow(r_jk, 2)) / (
             2.0 * r_ij * r_ik
         )
-        
+
         # Required in order to catch NaNs during backprop
         if triple_masks is not None:
             cos_theta[triple_masks == 0] = 0.0
@@ -161,6 +164,12 @@ class APDistribution(nn.Module):
         if self.cutoff_function is not None:
             cutoffs = self.cutoff_function(r_ik)
             radial_distribution = radial_distribution * cutoffs.unsqueeze(-1)
+        #if self.cutoff_function2 is not None:
+        #    cutoffs = self.cutoff_function2(r_ij)
+        #    radial_distribution = radial_distribution * cutoffs.unsqueeze(-1)
+
+        if triple_masks is not None:
+            radial_distribution[triple_masks == 0] = 0.0
 
         # Weigh elements if requested
         if elemental_weights is not None:
@@ -171,7 +180,60 @@ class APDistribution(nn.Module):
 
         radial_distribution = torch.reshape(radial_distribution, (radial_distribution.shape[0], radial_distribution.shape[1], nangle, nangle, radial_distribution.shape[3], radial_distribution.shape[4]))
         radial_distribution = torch.sum(radial_distribution, 3)
+        #radial_distribution = torch.sum(radial_distribution, 2)
         radial_distribution = radial_distribution.view(nbatch, natoms, nangle, -1)
+        return radial_distribution
+
+class APDistribution_Mod(nn.Module):
+    def __init__(
+        self,
+        radial_filter,
+        cutoff_functions=CosineCutoff,
+        #cutoff_function2=None
+    ):
+        super(APDistribution_Mod, self).__init__()
+        self.radial_filter = radial_filter
+        self.cutoff_function = cutoff_functions
+        #self.cutoff_function2 = cutoff_function2
+
+    def forward(self, r_ij, r_ik, r_jk, triple_masks=None, elemental_weights=None):
+        nbatch, natoms, npairs = r_ij.size()
+        nneigh = natoms - 1
+        nangle = nneigh - 1
+
+        # Use cosine rule to compute cos( theta_ijk )
+        cos_theta = (torch.pow(r_ij, 2) + torch.pow(r_ik, 2) - torch.pow(r_jk, 2)) / (
+            2.0 * r_ij * r_ik
+        )
+
+        # Required in order to catch NaNs during backprop
+        if triple_masks is not None:
+            cos_theta[triple_masks == 0] = 0.0
+
+        radial_distribution = self.radial_filter(cos_theta)
+
+        # If requested, apply cutoff function
+        if self.cutoff_function is not None:
+            cutoffs = self.cutoff_function(r_ik)
+            radial_distribution = radial_distribution * cutoffs.unsqueeze(-1)
+        #if self.cutoff_function2 is not None:
+        #    cutoffs = self.cutoff_function2(r_ij)
+        #    radial_distribution = radial_distribution * cutoffs.unsqueeze(-1)
+
+        if triple_masks is not None:
+            radial_distribution[triple_masks == 0] = 0.0
+
+        # Weigh elements if requested
+        if elemental_weights is not None:
+            radial_distribution = (
+                radial_distribution[:, :, :, :, None]
+                * elemental_weights[:, :, :, None, :].float()
+            )
+
+        radial_distribution = torch.reshape(radial_distribution, (radial_distribution.shape[0], radial_distribution.shape[1], nneigh, nangle, radial_distribution.shape[3], radial_distribution.shape[4]))
+        radial_distribution = torch.sum(radial_distribution, 3)
+        #radial_distribution = torch.sum(radial_distribution, 2)
+        radial_distribution = radial_distribution.view(nbatch, natoms, nneigh, -1)
         return radial_distribution
 
 class BehlerAngular(nn.Module):
@@ -318,7 +380,7 @@ class RadialDistribution(nn.Module):
         if self.cutoff_function is not None:
             cutoffs = self.cutoff_function(r_ij)
             radial_distribution = radial_distribution * cutoffs.unsqueeze(-1)
-
+        
         # Apply neighbor mask
         if neighbor_mask is not None:
             radial_distribution = radial_distribution * torch.unsqueeze(

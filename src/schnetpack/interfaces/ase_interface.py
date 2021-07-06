@@ -15,7 +15,6 @@ import os
 
 from schnetpack.data.atoms import AtomsConverter
 from schnetpack.utils.spk_utils import DeprecationHelper
-from schnetpack import Properties
 
 from ase import units
 from ase.calculators.calculator import Calculator, all_changes
@@ -23,6 +22,7 @@ from ase.io import read, write
 from ase.io.trajectory import Trajectory
 from ase.io.xyz import read_xyz, write_xyz
 from ase.md import VelocityVerlet, Langevin, MDLogger
+from ase.md.npt import NPT
 from ase.md.velocitydistribution import (
     MaxwellBoltzmannDistribution,
     Stationary,
@@ -56,9 +56,9 @@ class SpkCalculator(Calculator):
         **kwargs: Additional arguments for basic ase calculator class
     """
 
-    energy = Properties.energy
-    forces = Properties.forces
-    stress = Properties.stress
+    energy = "energy"
+    forces = "forces"
+    stress = "stress"
     implemented_properties = [energy, forces, stress]
 
     def __init__(
@@ -69,16 +69,13 @@ class SpkCalculator(Calculator):
         environment_provider=SimpleEnvironmentProvider(),
         energy=None,
         forces=None,
-        stress=None,
         energy_units="eV",
         forces_units="eV/Angstrom",
-        stress_units="eV/Angstrom/Angstrom/Angstrom",
         **kwargs
     ):
         Calculator.__init__(self, **kwargs)
 
         self.model = model
-        self.model.to(device)
 
         self.atoms_converter = AtomsConverter(
             environment_provider=environment_provider,
@@ -88,16 +85,10 @@ class SpkCalculator(Calculator):
 
         self.model_energy = energy
         self.model_forces = forces
-        self.model_stress = stress
 
         # Convert to ASE internal units
-        # MDUnits parses the given energy units and converts them to atomic units as the common denominator.
-        # These are then converted to ASE units
         self.energy_units = MDUnits.parse_mdunit(energy_units) * units.Ha
         self.forces_units = MDUnits.parse_mdunit(forces_units) * units.Ha / units.Bohr
-        self.stress_units = (
-            MDUnits.parse_mdunit(stress_units) * units.Ha / units.Bohr ** 3
-        )
 
     def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
         """
@@ -108,58 +99,39 @@ class SpkCalculator(Calculator):
         """
         # First call original calculator to set atoms attribute
         # (see https://wiki.fysik.dtu.dk/ase/_modules/ase/calculators/calculator.html#Calculator)
+        Calculator.calculate(self, atoms)
 
-        if self.calculation_required(atoms, properties):
-            Calculator.calculate(self, atoms)
-            # Convert to schnetpack input format
-            model_inputs = self.atoms_converter(atoms)
-            # Call model
-            model_results = self.model(model_inputs)
+        # Convert to schnetpack input format
+        model_inputs = self.atoms_converter(atoms)
+        # Call model
+        model_results = self.model(model_inputs)
 
-            results = {}
-            # Convert outputs to calculator format
-            if self.model_energy is not None:
-                if self.model_energy not in model_results.keys():
-                    raise SpkCalculatorError(
-                        "'{}' is not a property of your model. Please "
-                        "check the model "
-                        "properties!".format(self.model_energy)
-                    )
-                energy = model_results[self.model_energy].cpu().data.numpy()
-                results[self.energy] = (
-                    energy.item() * self.energy_units
-                )  # ase calculator should return scalar energy
-
-            if self.model_forces is not None:
-                if self.model_forces not in model_results.keys():
-                    raise SpkCalculatorError(
-                        "'{}' is not a property of your model. Please "
-                        "check the model"
-                        "properties!".format(self.model_forces)
-                    )
-                forces = model_results[self.model_forces].cpu().data.numpy()
-                results[self.forces] = (
-                    forces.reshape((len(atoms), 3)) * self.forces_units
+        results = {}
+        # Convert outputs to calculator format
+        if self.model_energy is not None:
+            if self.model_energy not in model_results.keys():
+                raise SpkCalculatorError(
+                    "'{}' is not a property of your model. Please "
+                    "check the model "
+                    "properties!".format(self.model_energy)
                 )
+            energy = model_results[self.model_energy].cpu().data.numpy()
+            results[self.energy] = energy.reshape(-1) * self.energy_units
 
-            if self.model_stress is not None:
-                if atoms.cell.volume <= 0.0:
-                    raise SpkCalculatorError(
-                        "Cell with 0 volume encountered for stress computation"
-                    )
+        if self.model_forces is not None:
+            if self.model_forces not in model_results.keys():
+                raise SpkCalculatorError(
+                    "'{}' is not a property of your model. Please "
+                    "check the model"
+                    "properties!".format(self.model_forces)
+                )
+            forces = model_results[self.model_forces].cpu().data.numpy()
+            results[self.forces] = forces.reshape((len(atoms), 3)) * self.forces_units
+        
+        press = self.calculate_numerical_stress(atoms)
+        results[self.stress] = press
 
-                if self.model_stress not in model_results.keys():
-                    raise SpkCalculatorError(
-                        "'{}' is not a property of your model. Please "
-                        "check the model"
-                        "properties! If desired, stress tensor computation can be "
-                        "activated via schnetpack.utils.activate_stress_computation "
-                        "at ones own risk.".format(self.model_stress)
-                    )
-                stress = model_results[self.model_stress].cpu().data.numpy()
-                results[self.stress] = stress.reshape((3, 3)) * self.stress_units
-
-            self.results = results
+        self.results = results
 
 
 class AseInterface:
@@ -260,6 +232,9 @@ class AseInterface:
         time_step=0.5,
         temp_init=300,
         temp_bath=None,
+        external_stress=None,
+        ttime=None,
+        pfactor=None,
         reset=False,
         interval=1,
     ):
@@ -288,15 +263,24 @@ class AseInterface:
             self._init_velocities(temp_init=temp_init)
 
         # Set up dynamics
-        if temp_bath is None:
+        if temp_bath is None and external_stress is None:
             self.dynamics = VelocityVerlet(self.molecule, time_step * units.fs)
-        else:
+        elif external_stress is None:
             self.dynamics = Langevin(
                 self.molecule,
                 time_step * units.fs,
                 temp_bath * units.kB,
                 1.0 / (100.0 * units.fs),
             )
+        else:
+            self.dynamics = NPT(
+                self.molecule,
+                time_step * units.fs,
+                temp_bath * units.kB,
+                external_stress * units.GPa,
+                ttime * units.fs,
+                pfactor * units.fs**2*units.GPa,
+            )   
 
         # Create monitors for logfile and a trajectory file
         logfile = os.path.join(self.working_dir, "%s.log" % name)

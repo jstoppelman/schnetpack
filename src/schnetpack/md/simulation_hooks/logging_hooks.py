@@ -214,11 +214,9 @@ class PropertyStream(DataStream):
             )
 
         # Determine present properties, order and shape thereof
-        (
-            properties_entries,
-            properties_shape,
-            properties_positions,
-        ) = self._get_properties_structures(simulator.system.properties)
+        properties_entries, properties_shape, properties_positions = self._get_properties_structures(
+            simulator.system.properties
+        )
 
         data_shape = (self.n_replicas, self.n_molecules, properties_entries)
 
@@ -313,11 +311,9 @@ class SimulationStream(PropertyStream):
             "temperature_centroid": simulator.system.centroid_temperature,
         }
 
-        (
-            properties_entries,
-            properties_shape,
-            properties_positions,
-        ) = self._get_properties_structures(property_dictionary)
+        properties_entries, properties_shape, properties_positions = self._get_properties_structures(
+            property_dictionary
+        )
 
         data_shape = (self.n_replicas, self.n_molecules, properties_entries)
 

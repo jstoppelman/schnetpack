@@ -23,7 +23,7 @@ class Trainer:
        loss_is_normalized (bool, optional): if True, the loss per data point will be
            reported. Otherwise, the accumulated loss is reported.
 
-    """
+   """
 
     def __init__(
         self,
@@ -177,22 +177,23 @@ class Trainer:
                 #                    train_iter = tqdm(self.train_loader)
                 #                else:
                 train_iter = self.train_loader
-
+                 
                 for train_batch in train_iter:
                     self.optimizer.zero_grad()
-
                     for h in self.hooks:
                         h.on_batch_begin(self, train_batch)
-
+                    
                     # move input to gpu, if needed
                     train_batch = {k: v.to(device) for k, v in train_batch.items()}
 
+                    #with torch.autograd.detect_anomaly():
                     result = self._model(train_batch)
-                    loss = self.loss_fn(train_batch, result)
+                    loss = self.loss_fn(train_batch, result) 
                     loss.backward()
+
                     self.optimizer.step()
                     self.step += 1
-
+                    
                     for h in self.hooks:
                         h.on_batch_end(self, train_batch, result, loss)
 
@@ -209,6 +210,7 @@ class Trainer:
 
                     val_loss = 0.0
                     n_val = 0
+                    print("Validation") 
                     for val_batch in self.validation_loader:
                         # append batch_size
                         vsize = list(val_batch.values())[0].size(0)
@@ -224,6 +226,7 @@ class Trainer:
                         val_batch_loss = (
                             self.loss_fn(val_batch, val_result).data.cpu().numpy()
                         )
+                        
                         if self.loss_is_normalized:
                             val_loss += val_batch_loss * vsize
                         else:
@@ -231,7 +234,7 @@ class Trainer:
 
                         for h in self.hooks:
                             h.on_validation_batch_end(self, val_batch, val_result)
-
+                    #sys.exit()
                     # weighted average over batches
                     if self.loss_is_normalized:
                         val_loss /= n_val
@@ -242,7 +245,6 @@ class Trainer:
 
                     for h in self.hooks:
                         h.on_validation_end(self, val_loss)
-
                 for h in self.hooks:
                     h.on_epoch_end(self)
 

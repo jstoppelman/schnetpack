@@ -15,10 +15,11 @@ References
    The Journal of Chemical Physics 148 (24), 241709. 2018.
 """
 
-from schnetpack.representation.schnet import SchNet, SchNetInteraction
+from schnetpack.representation.schnet import SchNet, SchNetInteraction, SchNet_mod
 from schnetpack.representation.hdnn import (
     BehlerSFBlock,
     StandardizeSF,
     SymmetryFunctions,
     APNet,
+    APNet_mod,
 )

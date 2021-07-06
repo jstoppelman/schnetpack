@@ -14,6 +14,7 @@ class Properties:
     neighbors = "_neighbors"
     neighbor_mask = "_neighbor_mask"
     cell_offset = "_cell_offset"
+    cell_offset_intra = "_cell_offset_intra"
     neighbor_pairs_j = "_neighbor_pairs_j"
     neighbor_pairs_k = "_neighbor_pairs_k"
     neighbor_pairs_mask = "_neighbor_pairs_mask"
@@ -80,7 +81,7 @@ class Properties:
     }
 
 
-from schnetpack.atomistic import AtomisticModel, PairwiseModel
+from schnetpack.atomistic import AtomisticModel, PairwiseModel, PairwiseModel_Mod
 from schnetpack.data import *
 
 from schnetpack import atomistic
